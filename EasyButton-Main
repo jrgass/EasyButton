@@ -1,0 +1,141 @@
+/* this script is to be run for all Off-Prem accounts*/
+
+BEGIN TRAN
+;SET CONTEXT_INFO - 2
+IF ServerProperty('Edition') = 'SQL Azure' or SERVERPROPERTY('productversion') >= '13.0.0.0'
+EXEC sp_set_session_context 'TriggerGuardID', - 2
+
+/*Declare conditions used for updates - this is the only area you need to change daily*/
+;declare @thrudate datetime = '2021-11-23' /*Set this to the delivery date (tomorrow)*/
+declare @floor int = 4
+declare @ceiling int = 5
+declare @rounding bit = 1 /*(0  will round down, 1  will round up)*/
+
+/*Gather up the customers who are eligible to change*/
+declare @interestingcustomers table (cusnid int)
+insert into @interestingcustomers 
+    select cusnid from customers c
+	join employees e on e.EmpNid=c.slsempnid
+	where c.IsOffPremise = 1 /*1=Off-Prem, 0=On-Prem*/
+	and c.RecKey not in ('1253', '1786','8575','8158','3051','3061','8272','2260','1263','2046','2113','8238','3588','2262','5398','2240','3085','1233','2236','6681','3942','3063','2296','8174','2916','8138','2233','5449','2800','2300','3889','2254','8239','3072','2277','2481','8777','2072','4132') /* exclude customers based on reckey (found in eostar customer record)*/
+	and SlsChanNid not in (10, 11, 14, 36) /*Exclude specific sales channels: Grocery - Chain, Grocery - Indy, Catering, Club Store, Mass Merchandiser*/
+	--and e.ReportsToNid not in ('83','1074','1075') /*exclude customers tied to these team leaders (and by extension, the sales person).*/
+	--and CountyNid not in (6,16,9,10,13,29) /*Exclude specific counties like Kalamazoo and Calhoun*/
+    and whsenid = 4 /*Limit all changes to orders coming out of the 60th warehouse*/
+       
+/*Gather up items that are eligible to change*/
+declare @interestingitems table (itemnid int)
+insert into @interestingitems
+    select i.ItemNid 
+    from items i
+	--join ProductSetProducts psp on psp.ItemNid=i.ItemNid /* uncomment if you want to target specific product sets, i.e. PTP items only  - need product set nid*/
+    where i.SellOnlyViaAllocations = 0
+	--and psp.ProductSetNid = 115 /* uncomment if you want to target specific product sets, i.e. PTP items only  - need product set nid*/
+    and i.LedgerGroupNid <> 17 /*Exclude Kegs*/
+    and i.IsAltPackParentNid = 1 /*Exclude alt-packs*/
+    and i.CatNid not in (11,24) /* Exclude wine and high-proof wine*/
+	and i.RecKey not in ('50811') /*Exclude Specific Items*/
+	--and i.BrandNid not in (2753, 2754) /*Exclude Specific Brands*/
+
+/*Gather up routes that are eligible to change*/
+declare @interestingDrivers table (empnid int)
+insert into @interestingDrivers
+    select empnid 
+    from employees 
+    --where reckey in ('4') --excludes all customers tied to this emplayee
+
+/*Do not change anything below these lines!*/
+
+/*Report Data being Changed*/
+select  i.RecName as item
+        ,i.RecKey as item#
+        ,cs.recname as customer
+        ,cs.reckey as customer#
+        ,po.ticketnumber
+        , QtyShipped
+        , case  when @rounding = 0 then floor(cast(QtyShipped as decimal(10,2))/2) 
+                when @rounding = 1 then ceiling(cast(QtyShipped as decimal(10,2))/2) end as NewQtyShipped
+from pendingorders po 
+join pendingorderlines pol on pol.orderticketnumber = po.ticketnumber
+join @interestingcustomers c on c.cusnid = po.ToCusNid
+join @interestingitems ii on ii.itemnid = pol.itemnid
+join @interestingDrivers d on d.empnid = po.DrvEmpNid
+join Items i on i.ItemNid = pol.itemnid
+join Customers cs on cs.cusnid = po.ToCusNid
+where convert(date,saleshistorydate) = @thrudate
+and OTLCommitDate is not null
+and qtyshipped between @floor and @ceiling
+and po.TicketNumber not in (select ordernumber from pallets)
+and coalesce(po.ordertypenid,'') not in (12) -- Excluding "Mixed Pallets" Order Type
+order by qtyshipped desc
+
+/*Update Orderlines Qty*/
+Update ol 
+set ol.QtyShipped = case    when @rounding = 0 then floor(cast(QtyShipped as decimal(10,2))/2) 
+                            when @rounding = 1 then ceiling(cast(QtyShipped as decimal(10,2))/2) end 
+from pendingorders po 
+join orderlines ol on ol.orderticketnumber = po.ticketnumber
+join @interestingcustomers c on c.cusnid = po.ToCusNid
+join @interestingitems ii on ii.itemnid = ol.itemnid
+join @interestingDrivers d on d.empnid = po.DrvEmpNid
+where convert(date,saleshistorydate) = @thrudate
+and OTLCommitDate is not null
+and qtyshipped between @floor and @ceiling
+and po.TicketNumber not in (select ordernumber from pallets)
+and coalesce(po.ordertypenid,'') not in (12) -- Excluding "Mixed Pallets" Order Type
+
+/*Update PendingOrderlines Qty*/
+Update pol 
+set pol.QtyShipped = case   when @rounding = 0 then floor(cast(QtyShipped as decimal(10,2))/2) 
+                            when @rounding = 1 then ceiling(cast(QtyShipped as decimal(10,2))/2) end 
+from pendingorders po 
+join pendingorderlines pol on pol.orderticketnumber = po.ticketnumber
+join @interestingcustomers c on c.cusnid = po.ToCusNid
+join @interestingitems ii on ii.itemnid = pol.itemnid
+join @interestingDrivers d on d.empnid = po.DrvEmpNid
+where convert(date,saleshistorydate) = @thrudate
+and OTLCommitDate is not null
+and qtyshipped between @floor and @ceiling
+and po.TicketNumber not in (select ordernumber from pallets)
+and coalesce(po.ordertypenid,'') not in (12) -- Excluding "Mixed Pallets" Order Type
+
+/*Update PendingOrder Totals*/
+update po
+set po.totalsale = x.totalsale
+    ,po.TotalDisc = x.totaldisc
+from pendingorders po 
+join 
+(
+    select sum(totalsale) as TotalSale, sum(totaldisc) as TotalDisc,OrderTicketNumber from pendingorderlines pol group by orderticketnumber
+)x on x.Orderticketnumber = po.ticketnumber
+join @interestingcustomers c on c.cusnid = po.ToCusNid
+where convert(date,saleshistorydate) = @thrudate
+and OTLCommitDate is not null
+and (po.TotalSale <> x.TotalSale or po.TotalDisc <> x.TotalDisc)
+
+/*Update Order totals*/
+update po
+set po.totalsale = x.totalsale
+    ,po.TotalDisc = x.totaldisc
+from orders po 
+join 
+(
+    select sum(totalsale) as TotalSale, sum(totaldisc) as TotalDisc,OrderTicketNumber from pendingorderlines pol group by orderticketnumber
+)x on x.Orderticketnumber = po.ticketnumber
+join @interestingcustomers c on c.cusnid = po.ToCusNid
+where convert(date,saleshistorydate) = @thrudate
+and OTLCommitDate is not null
+and (po.TotalSale <> x.TotalSale or po.TotalDisc <> x.TotalDisc)
+
+--Bump WMSMasterControl for auto-refresh on eoWarehouse
+update wms
+set wms.WMSSerializationVersion = wms.WMSSerializationVersion + 1
+from WMSMasterControl wms
+update wms
+set wms.WMSInventoryCacheVersion = wms.WMSInventoryCacheVersion + 1
+from MasterControl wms
+
+delete from UpgradeScripts
+where ScriptName = 'eo_csharp_UpgradeScript_RecomputeInventoryDemands_4'
+
+rollback TRAN
